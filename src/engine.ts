@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import dns from "node:dns/promises";
 import https from "node:https";
 import net from "node:net";
@@ -9,12 +10,13 @@ const WARMUP_MS = 1500;
 export const PHASE_MS = { quick: 4000, full: 8000 } as const;
 export type Mode = keyof typeof PHASE_MS;
 const UP_CHUNK = Buffer.alloc(64 * 1024, 0x61);
-const UP_BODY = 1024 * 1024;
+// Small bodies keep upload acks frequent and out of sync across streams, so the live chart stays smooth.
+const UP_BODY = 256 * 1024;
 const DOWN_BODY = 4 * 1000 * 1000;
 
 export type Phase = "idle" | "latency" | "download" | "upload" | "done" | "error";
 
-export type Meta = { ip?: string; colo?: string; city?: string; isp?: string };
+export type Meta = { ip?: string; colo?: string; city?: string; isp?: string; server?: string };
 
 export type Progress = {
   phase: Phase;
@@ -38,6 +40,8 @@ class HttpError extends Error {
     super(`HTTP ${status}`);
   }
 }
+
+class RateLimited extends Error {}
 
 function request(
   method: "GET" | "POST",
@@ -102,11 +106,13 @@ async function ping(signal: AbortSignal): Promise<number> {
 }
 
 async function measureLatency(signal: AbortSignal, onTick: (p: number) => void) {
-  const r = await request("GET", "/__down?bytes=0", { signal });
+  const r = await request("GET", "/__down?bytes=0", { signal }).catch(() => undefined);
+  const h = r?.headers ?? {};
+  const colo = String(h["cf-meta-colo"] ?? h["colo"] ?? "");
   const meta: Meta = {
-    ip: String(r.headers["cf-meta-ip"] ?? ""),
-    colo: String(r.headers["cf-meta-colo"] ?? r.headers["colo"] ?? ""),
-    city: String(r.headers["cf-meta-city"] ?? ""),
+    ip: String(h["cf-meta-ip"] ?? "") || undefined,
+    colo,
+    server: colo ? `Cloudflare ${colo}` : undefined,
   };
   const samples: number[] = [];
   const n = 20;
@@ -122,7 +128,7 @@ async function measureThroughput(
   kind: "download" | "upload",
   phaseMs: number,
   signal: AbortSignal,
-  onSample: (mbps: number | undefined, progress: number) => void,
+  onSample: (mbps: number | undefined, progress: number, steady?: number) => void,
   onLoadedPing?: (ms: number) => void,
 ) {
   const ctrl = new AbortController();
@@ -138,7 +144,8 @@ async function measureThroughput(
   };
 
   let rateLimited = false;
-  const stream = async () => {
+  const stream = async (_: unknown, i: number) => {
+    await new Promise((r) => setTimeout(r, i * 120));
     while (!ctrl.signal.aborted) {
       try {
         // Cloudflare answers 429 for large single downloads once an IP has run several tests; small requests last longer.
@@ -180,7 +187,9 @@ async function measureThroughput(
     if (now - start < WARMUP_MS || bytes === 0) return onSample(undefined, (now - start) / phaseMs);
     window.push(inst);
     if (window.length > 8) window.shift();
-    onSample(window.reduce((a, b) => a + b, 0) / window.length, Math.min(1, (now - start) / phaseMs));
+    // Chart gets the 2s rolling rate; the headline uses the steady average so it does not jump around.
+    const steady = (steadyBytes * 8) / ((now - start - WARMUP_MS) / 1000) / 1e6;
+    onSample(window.reduce((a, b) => a + b, 0) / window.length, Math.min(1, (now - start) / phaseMs), steady);
     if (now - start >= phaseMs) ctrl.abort();
   }, 250);
 
@@ -188,19 +197,34 @@ async function measureThroughput(
   clearInterval(timer);
   signal.removeEventListener("abort", abort);
   if (signal.aborted) throw new Error("Cancelled");
-  if (rateLimited) throw new Error("Cloudflare is rate limiting this network. Try again in a few minutes.");
+  if (rateLimited) throw new RateLimited();
 
   const steadySec = (performance.now() - start - WARMUP_MS) / 1000;
   return { mbps: (steadyBytes * 8) / steadySec / 1e6, loadedPingMs: loaded.length ? median(loaded) : undefined };
 }
 
-async function lookupIsp(): Promise<string | undefined> {
+// Apple's built-in test, used when Cloudflare rate limits this IP. It only reports at the end.
+function appleTest(signal: AbortSignal, args: string[]): Promise<{ down?: number; up?: number }> {
+  return new Promise((resolve, reject) => {
+    execFile("/usr/bin/networkQuality", ["-c", "-s", "-M", "15", ...args], { signal }, (err, out) => {
+      if (err) return reject(signal.aborted ? new Error("Cancelled") : err);
+      try {
+        const j = JSON.parse(out) as { dl_throughput?: number; ul_throughput?: number };
+        resolve({ down: j.dl_throughput && j.dl_throughput / 1e6, up: j.ul_throughput && j.ul_throughput / 1e6 });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+async function lookupIsp(): Promise<{ isp?: string; ip?: string }> {
   try {
     const res = await fetch("https://ipinfo.io/json", { signal: AbortSignal.timeout(4000) });
-    const org = ((await res.json()) as { org?: string }).org;
-    return org?.replace(/^AS\d+\s+/, "");
+    const j = (await res.json()) as { org?: string; ip?: string };
+    return { isp: j.org?.replace(/^AS\d+\s+/, ""), ip: j.ip };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
@@ -227,26 +251,57 @@ export async function runSpeedTest(
   push({});
   const lat = await measureLatency(signal, (p) => push({ phaseProgress: p }));
   push({ pingMs: lat.pingMs, jitterMs: lat.jitterMs, meta: lat.meta });
-  isp.then((name) => push({ meta: { ...state.meta, isp: name } }));
+  isp.then((r) => push({ meta: { ...state.meta, isp: r.isp, ip: state.meta.ip ?? r.ip } }));
+
+  // Fake progress while networkQuality runs, since it prints nothing until it finishes.
+  const appleFallback = async (phase: "download" | "upload") => {
+    push({ phase, phaseProgress: 0, meta: { ...state.meta, server: "Apple (Cloudflare rate limited)" } });
+    const t0 = Date.now();
+    const tick = setInterval(() => push({ phaseProgress: Math.min(0.95, (Date.now() - t0) / 30000) }), 500);
+    try {
+      return await appleTest(signal, phase === "upload" ? ["-d"] : []);
+    } finally {
+      clearInterval(tick);
+    }
+  };
 
   push({ phase: "download", phaseProgress: 0 });
-  const down = await measureThroughput(
-    "download",
-    phaseMs,
-    signal,
-    (mbps, p) => {
-      if (mbps !== undefined) state.downloadSeries.push(mbps);
-      push({ downloadMbps: mbps ?? state.downloadMbps, phaseProgress: p });
-    },
-    (ms) => push({ loadedPingMs: ms }),
-  );
-  push({ downloadMbps: down.mbps, loadedPingMs: down.loadedPingMs });
+  try {
+    const down = await measureThroughput(
+      "download",
+      phaseMs,
+      signal,
+      (mbps, p, steady) => {
+        if (mbps !== undefined) state.downloadSeries.push(mbps);
+        push({ downloadMbps: steady ?? state.downloadMbps, phaseProgress: p });
+      },
+      (ms) => push({ loadedPingMs: ms }),
+    );
+    push({ downloadMbps: down.mbps, loadedPingMs: down.loadedPingMs });
+  } catch (e) {
+    if (!(e instanceof RateLimited)) throw e;
+    const r = await appleFallback("download");
+    push({
+      downloadMbps: r.down,
+      uploadMbps: r.up,
+      phase: "done",
+      phaseProgress: 1,
+      meta: { ...state.meta, isp: (await isp).isp },
+    });
+    return state;
+  }
 
   push({ phase: "upload", phaseProgress: 0 });
-  const up = await measureThroughput("upload", phaseMs, signal, (mbps, p) => {
-    if (mbps !== undefined) state.uploadSeries.push(mbps);
-    push({ uploadMbps: mbps ?? state.uploadMbps, phaseProgress: p });
-  });
-  push({ uploadMbps: up.mbps, phase: "done", phaseProgress: 1, meta: { ...state.meta, isp: await isp } });
+  try {
+    const up = await measureThroughput("upload", phaseMs, signal, (mbps, p, steady) => {
+      if (mbps !== undefined) state.uploadSeries.push(mbps);
+      push({ uploadMbps: steady ?? state.uploadMbps, phaseProgress: p });
+    });
+    push({ uploadMbps: up.mbps });
+  } catch (e) {
+    if (!(e instanceof RateLimited)) throw e;
+    push({ uploadMbps: (await appleFallback("upload")).up });
+  }
+  push({ phase: "done", phaseProgress: 1, meta: { ...state.meta, isp: (await isp).isp } });
   return state;
 }

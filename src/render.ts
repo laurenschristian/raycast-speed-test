@@ -170,7 +170,7 @@ export function renderSvg(p: Progress, theme: Theme, local: LocalInfo, prev?: Re
   const w = local.wifi;
   const band = w?.channel?.match(/(\d+(?:\.\d+)?GHz)/)?.[1];
   const left: [string, string | undefined][] = [
-    ["Server", p.meta.colo ? `Cloudflare ${p.meta.colo}` : undefined],
+    ["Server", p.meta.server],
     ["Provider", p.meta.isp],
     ["Public IP", p.meta.ip],
     ["DNS", local.dns],
