@@ -1,0 +1,74 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "speed-test",
+  "title": "Speed Test",
+  "description": "Clean internet speed test: live charts, latency under load, Wi-Fi details, history and a menu bar monitor. Powered by Cloudflare.",
+  "icon": "icon.png",
+  "author": "laurenschristian",
+  "categories": [
+    "Developer Tools",
+    "System"
+  ],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "index",
+      "title": "Test Internet Speed",
+      "subtitle": "Speed Test",
+      "description": "Measure download, upload, latency, jitter and latency under load.",
+      "mode": "view"
+    },
+    {
+      "name": "speed-history",
+      "title": "Speed Test History",
+      "subtitle": "Speed Test",
+      "description": "Trend chart and details of past speed tests.",
+      "mode": "view"
+    },
+    {
+      "name": "menu-bar",
+      "title": "Speed Test Menu Bar",
+      "subtitle": "Speed Test",
+      "description": "Show the last result in the menu bar and run a quick test every hour.",
+      "mode": "menu-bar",
+      "interval": "1h"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.104.0"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^2.1.3",
+    "@types/node": "22.13.10",
+    "@types/react": "19.0.10",
+    "eslint": "^9.22.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.2"
+  },
+  "scripts": {
+    "build": "ray build -e dist",
+    "dev": "ray develop",
+    "fix-lint": "ray lint --fix",
+    "lint": "ray lint"
+  },
+  "preferences": [
+    {
+      "name": "mode",
+      "title": "Test Length",
+      "description": "Quick runs each phase for 4 seconds, Full for 8.",
+      "type": "dropdown",
+      "required": false,
+      "default": "full",
+      "data": [
+        {
+          "title": "Full (about 20 s)",
+          "value": "full"
+        },
+        {
+          "title": "Quick (about 12 s)",
+          "value": "quick"
+        }
+      ]
+    }
+  ]
+}
