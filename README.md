@@ -2,7 +2,7 @@
 
 A clean internet speed test for Raycast. Live charts, latency under load, Wi-Fi details, history and a menu bar monitor.
 
-![Speed Test](docs/screenshot.png)
+![Speed Test](docs/preview.png)
 
 ## What it measures
 
